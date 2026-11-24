@@ -1,13 +1,19 @@
 //! Full-screen TUI: pick a profile, see exactly what will change, switch.
 //!
-//! Long operations block on purpose. They take a second or two, and letting the
-//! event loop interleave keystrokes with sqlite writes would buy nothing but
-//! bugs.
+//! Two things shape this file:
+//!
+//! * A terminal programme cannot choose its own font. That belongs to the
+//!   terminal emulator, so the layout never assumes a light or dark palette and
+//!   uses `REVERSED` for emphasis — it stays readable either way. `codex-switch
+//!   font` flips the Windows Terminal setting if you want a different face.
+//! * Probing for running processes forks a helper on Windows. Doing that per
+//!   frame makes the UI feel dead, so the result is cached and refreshed only
+//!   when something actually happens.
 
 use crate::auth;
 use crate::backup;
 use crate::history;
-use crate::paths;
+use crate::paths::{self, RunningProcs};
 use crate::profile::{self, AuthKind, Keys, Profile, Profiles};
 use crate::switch::{self, Level, Msg, Options};
 use anyhow::{bail, Result};
@@ -20,6 +26,7 @@ use ratatui::{DefaultTerminal, Frame};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
+use unicode_width::UnicodeWidthStr;
 
 pub fn run() -> Result<()> {
     // Piped stdin/stdout has no raw mode. Fail with a usable message instead of
@@ -43,12 +50,17 @@ struct App {
     status: String,
     mode: Mode,
     quit: bool,
+    /// Cached: spawning a probe helper per frame would stall the event loop.
+    procs: RunningProcs,
+    /// Cached backup footprint (directory count, bytes).
+    backups: (usize, u64),
 }
 
 enum Mode {
     Browse,
     Confirm(Confirm),
     Form(Form),
+    Help,
 }
 
 struct Confirm {
@@ -105,11 +117,15 @@ impl App {
             status: "就绪".to_string(),
             mode: Mode::Browse,
             quit: false,
+            procs: RunningProcs::default(),
+            backups: (0, 0),
         };
-        app.note("↑↓ 选择 profile，Enter 切换，? 查看全部按键");
+        app.refresh_meta();
+        app.note("↑↓ 选择 · Enter 切换 · ? 看全部按键");
         Ok(app)
     }
 
+    /// Re-read everything from disk. Called at start and after any write.
     fn reload(&mut self) -> Result<()> {
         let (profiles, keys) = switch::load()?;
         self.state = auth::inspect(&auth::read().unwrap_or_default());
@@ -118,7 +134,13 @@ impl App {
         if self.selected >= self.profiles.profiles.len() {
             self.selected = self.profiles.profiles.len().saturating_sub(1);
         }
+        self.refresh_meta();
         Ok(())
+    }
+
+    fn refresh_meta(&mut self) {
+        self.procs = paths::running_codex_processes();
+        self.backups = backup::usage();
     }
 
     fn note(&mut self, text: impl Into<String>) {
@@ -148,39 +170,61 @@ impl App {
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|f| draw(f, self))?;
-            if !event::poll(Duration::from_millis(200))? {
+            if !event::poll(Duration::from_millis(250))? {
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            if let Some(action) = self.on_key(key) {
-                self.execute(action, terminal)?;
-                self.status = "就绪".to_string();
+            match event::read()? {
+                // Windows delivers Release events too; acting on them would
+                // double every keystroke.
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if let Some(action) = self.on_key(key) {
+                        self.execute(action, terminal)?;
+                        self.status = "就绪".to_string();
+                    }
+                }
+                Event::Resize(..) => {}
+                _ => {}
             }
         }
         Ok(())
     }
 
+    /// Route one keystroke through the current mode.
+    ///
+    /// The mode is taken out first so handlers can mutate `self` freely. What a
+    /// handler puts back must survive: assigning a default afterwards is what
+    /// used to swallow every popup the moment it opened.
     fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
-        let mode = std::mem::replace(&mut self.mode, Mode::Browse);
-        let (next, action) = self.handle(mode, key);
-        self.mode = next;
-        action
-    }
-
-    fn handle(&mut self, mode: Mode, key: KeyEvent) -> (Mode, Option<Action>) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
             self.quit = true;
-            return (Mode::Browse, None);
+            return None;
         }
+
+        let mode = std::mem::replace(&mut self.mode, Mode::Browse);
         match mode {
-            Mode::Browse => (Mode::Browse, self.browse_key(key)),
-            Mode::Confirm(c) => self.confirm_key(c, key),
-            Mode::Form(f) => self.form_key(f, key),
+            Mode::Browse => self.browse_key(key),
+            Mode::Help => {
+                let close = matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter
+                );
+                if !close {
+                    self.mode = Mode::Help;
+                }
+                None
+            }
+            Mode::Confirm(c) => {
+                let (mode, action) = self.confirm_key(c, key);
+                self.mode = mode;
+                action
+            }
+            Mode::Form(f) => {
+                let (mode, action) = self.form_key(f, key);
+                self.mode = mode;
+                action
+            }
         }
     }
 
@@ -199,6 +243,14 @@ impl App {
                 if self.selected + 1 < self.profiles.profiles.len() {
                     self.selected += 1;
                 }
+                None
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.selected = 0;
+                None
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.selected = self.profiles.profiles.len().saturating_sub(1);
                 None
             }
             KeyCode::Enter => {
@@ -279,6 +331,13 @@ impl App {
             }
             KeyCode::Char('v') => Some(Action::Verify),
             KeyCode::Char('b') => Some(Action::Backup),
+            KeyCode::Char('r') => {
+                match self.reload() {
+                    Ok(()) => self.note("已重新读取 profiles / auth / 进程状态"),
+                    Err(e) => self.log.push(Msg::err(format!("{e:#}"))),
+                }
+                None
+            }
             KeyCode::Char('u') => match latest_manifest() {
                 Some(m) => {
                     self.mode = Mode::Confirm(Confirm {
@@ -315,9 +374,7 @@ impl App {
                 }
             },
             KeyCode::Char('?') => {
-                self.note(
-                    "↑↓/jk 选择 · Enter 切换 · e 设 Key · a 新增 · h 迁移历史 · v 校验 · b 备份 · u 回滚 · R 还原 · q 退出",
-                );
+                self.mode = Mode::Help;
                 None
             }
             _ => None,
@@ -357,11 +414,10 @@ impl App {
         if preview.needs_login {
             body.push("auth.json 里没有登录态，切换后需要跑一次 codex login".to_string());
         }
-        let procs = paths::running_codex_processes();
-        if procs.has_critical() {
+        if self.procs.has_critical() {
             body.push(format!(
                 "注意: Codex 主进程仍在运行 ({})",
-                procs.critical.join(", ")
+                self.procs.critical.join(", ")
             ));
         }
         self.mode = Mode::Confirm(Confirm {
@@ -485,20 +541,18 @@ impl App {
         match action {
             Action::Switch(id) => {
                 self.busy(terminal, format!("正在切换到 {id}…"));
-                let procs = paths::running_codex_processes();
+                let force = self.procs.has_critical();
                 let mut log = Vec::new();
                 let result = switch::run(
                     &id,
                     Options {
-                        force: procs.has_critical(),
+                        force,
                         ..Default::default()
                     },
                     |m| log.push(m),
                 );
                 match result {
-                    Ok(()) => {
-                        log.push(Msg::ok("完成。完全退出并重开 Codex 后生效"));
-                    }
+                    Ok(()) => log.push(Msg::ok("完成。完全退出并重开 Codex 后生效")),
                     Err(e) => log.push(Msg::err(format!("{e:#}"))),
                 }
                 self.absorb(log);
@@ -506,6 +560,7 @@ impl App {
                 if let Some(i) = self.profiles.profiles.iter().position(|p| p.id == id) {
                     self.selected = i;
                 }
+                drain_input();
             }
             Action::Migrate(provider) => {
                 self.busy(terminal, format!("正在迁移到 {provider}…"));
@@ -520,6 +575,8 @@ impl App {
                 }
                 let _ = switch::migrate_history(&provider, |m| log.push(m));
                 self.absorb(log);
+                self.reload()?;
+                drain_input();
             }
             Action::Verify => {
                 let provider = self.active_provider();
@@ -550,6 +607,7 @@ impl App {
                     Err(e) => log.push(Msg::err(format!("{e:#}"))),
                 }
                 self.absorb(log);
+                self.reload()?;
             }
             Action::Rollback(manifest) => {
                 self.busy(terminal, "正在回滚…");
@@ -563,6 +621,8 @@ impl App {
                     Err(e) => log.push(Msg::err(format!("{e:#}"))),
                 }
                 self.absorb(log);
+                self.reload()?;
+                drain_input();
             }
             Action::Restore(dir) => {
                 self.busy(terminal, "正在还原备份…");
@@ -573,6 +633,7 @@ impl App {
                 }
                 self.absorb(log);
                 self.reload()?;
+                drain_input();
             }
         }
         Ok(())
@@ -586,6 +647,15 @@ impl App {
     }
 }
 
+/// Drop keystrokes buffered while a long write held the loop.
+fn drain_input() {
+    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        if event::read().is_err() {
+            break;
+        }
+    }
+}
+
 fn latest_manifest() -> Option<PathBuf> {
     backup::list().ok()?.into_iter().find_map(|d| {
         let m = d.join("manifest.json");
@@ -593,177 +663,251 @@ fn latest_manifest() -> Option<PathBuf> {
     })
 }
 
+// ---------------------------------------------------------------- styling
+
+fn s_dim() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn s_bold() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+fn s_dim_bold() -> Style {
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Selection and tags use reverse video rather than a fixed background, so the
+/// result is legible on light and dark schemes alike.
+fn s_pill() -> Style {
+    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+}
+
+fn s_ok() -> Style {
+    Style::default().fg(Color::Green)
+}
+
+fn s_warn() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+fn s_err() -> Style {
+    Style::default().fg(Color::Red)
+}
+
+fn s_accent() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
 // ---------------------------------------------------------------- rendering
 
 fn draw(f: &mut Frame, app: &App) {
+    let log_h = (f.area().height / 4).clamp(4, 9);
     let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(7),
-        Constraint::Length(7),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(6),
+        Constraint::Length(log_h),
         Constraint::Length(1),
     ])
     .split(f.area());
 
     draw_header(f, app, chunks[0]);
+    draw_rule(f, chunks[1]);
 
-    let body = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(chunks[1]);
-    draw_list(f, app, body[0]);
-    draw_details(f, app, body[1]);
-    draw_log(f, app, chunks[2]);
-    draw_footer(f, app, chunks[3]);
+    if f.area().width < 72 {
+        let body = Layout::vertical([Constraint::Min(4), Constraint::Min(6)]).split(chunks[2]);
+        draw_list(f, app, body[0]);
+        draw_details(f, app, body[1]);
+    } else {
+        let body = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(chunks[2]);
+        draw_list(f, app, body[0]);
+        draw_details(f, app, body[1]);
+    }
+
+    draw_log(f, app, chunks[3]);
+    draw_footer(f, app, chunks[4]);
 
     match &app.mode {
         Mode::Browse => {}
         Mode::Confirm(c) => draw_confirm(f, c),
         Mode::Form(form) => draw_form(f, form),
+        Mode::Help => draw_help(f),
     }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let auth_desc = app.state.describe();
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(Line::from(vec![
-            Span::styled(
-                " codex-switch ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("v{} ", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]))
-        .title_top(
-            Line::from(vec![
-                Span::styled("当前 ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    app.profiles.active.clone(),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(auth_desc, Style::default().fg(Color::DarkGray)),
-                Span::raw(" "),
-            ])
-            .right_aligned(),
-        );
+    let mut left: Vec<Span> = vec![
+        Span::styled(" codex-switch ", s_bold()),
+        Span::styled(format!("{} ", env!("CARGO_PKG_VERSION")), s_dim()),
+        Span::raw(" "),
+        Span::styled(format!(" {} ", app.profiles.active), s_pill()),
+    ];
+    if area.width >= 96 {
+        left.push(Span::styled(" · ", s_dim()));
+        left.push(Span::styled(fit(&app.state.describe(), 34), s_dim()));
+    }
 
-    let procs = paths::running_codex_processes();
-    let (proc_text, proc_style) = if procs.has_critical() {
+    let (badge, badge_style) = if app.procs.has_critical() {
         (
-            format!("Codex 运行中: {}", procs.critical.join(", ")),
-            Style::default().fg(Color::Yellow),
+            format!("● Codex 运行中 · {}", app.procs.critical.join(", ")),
+            s_warn(),
         )
     } else {
-        (
-            "Codex 未运行".to_string(),
-            Style::default().fg(Color::Green),
-        )
+        ("● Codex 未运行".to_string(), s_ok())
     };
+    let mut right: Vec<Span> = vec![];
+    if app.status != "就绪" {
+        right.push(Span::styled(format!("{} ", app.status), s_dim()));
+    }
+    right.push(Span::styled(badge, badge_style));
+    right.push(Span::raw(" "));
 
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let right_w = (line_width(&right) as u16).min(area.width.saturating_sub(12));
+    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(right_w)]).split(area);
+    f.render_widget(Paragraph::new(Line::from(left)), cols[0]);
+    f.render_widget(Paragraph::new(Line::from(right)), cols[1]);
+}
+
+fn draw_rule(f: &mut Frame, area: Rect) {
+    let rule = "─".repeat(area.width as usize);
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(proc_text, proc_style),
-            Span::styled("   ", Style::default()),
-            Span::styled(app.status.clone(), Style::default().fg(Color::DarkGray)),
-        ])),
-        inner,
+        Paragraph::new(Line::from(Span::styled(rule, s_dim()))),
+        area,
     );
 }
 
 fn draw_list(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(s_dim())
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("profiles", s_bold()),
+            Span::raw(" "),
+        ]));
+
+    if app.profiles.profiles.is_empty() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled("   还没有 profile", s_warn())),
+                Line::from(Span::styled("   按 a 新增一个", s_dim())),
+            ])
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    // Text is padded by display width: a CJK glyph is two cells wide, and
+    // padding by char count leaves the columns jagged.
+    let inner = area.width.saturating_sub(2) as usize;
+    let row_w = inner.saturating_sub(2); // highlight symbol
+                                         // marker + name + auth(8) + gap(2) + status(6): reserve the status column so
+                                         // the badge never collides with the auth label. On a narrow pane the auth
+                                         // word is dropped instead — the details pane repeats it anyway.
+    let show_auth = row_w >= 34;
+    let name_w = if show_auth {
+        row_w.saturating_sub(19)
+    } else {
+        row_w.saturating_sub(11)
+    }
+    .clamp(6, 26);
+
     let items: Vec<ListItem> = app
         .profiles
         .profiles
         .iter()
         .map(|p| {
             let active = p.id == app.profiles.active;
-            let marker = if active { "● " } else { "○ " };
-            let name = format!("{:<14}", truncate(&p.id, 14));
             let mut spans = vec![
                 Span::styled(
-                    marker.to_string(),
-                    Style::default().fg(if active {
-                        Color::Green
-                    } else {
-                        Color::DarkGray
-                    }),
+                    if active { "● " } else { "○ " },
+                    if active { s_ok() } else { s_dim() },
                 ),
                 Span::styled(
-                    name,
-                    Style::default()
-                        .fg(if active { Color::White } else { Color::Gray })
-                        .add_modifier(if active {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(
-                    format!("{:<10}", p.auth.short()),
-                    Style::default().fg(Color::DarkGray),
+                    pad(&fit(&p.id, name_w), name_w),
+                    if active { s_bold() } else { Style::default() },
                 ),
             ];
-            if p.auth == AuthKind::Apikey {
-                let has = app.keys.get(&p.id).is_some();
-                spans.push(Span::styled(
-                    if has { "key ✓" } else { "key ✗" },
-                    Style::default().fg(if has { Color::Green } else { Color::Red }),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    if app.state.has_tokens {
-                        "登录 ✓"
-                    } else {
-                        "需登录"
-                    },
-                    Style::default().fg(if app.state.has_tokens {
-                        Color::Green
-                    } else {
-                        Color::Yellow
-                    }),
-                ));
+            if show_auth {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(pad(p.auth.short(), 8), s_dim()));
             }
+
+            let (status, style) = match p.auth {
+                AuthKind::Apikey => {
+                    if app.keys.get(&p.id).is_some() {
+                        ("key ✓", s_ok())
+                    } else {
+                        ("key ✗", s_err())
+                    }
+                }
+                AuthKind::Chatgpt => {
+                    if app.state.has_tokens {
+                        ("登录 ✓", s_ok())
+                    } else {
+                        ("需登录", s_warn())
+                    }
+                }
+            };
+            let used: usize = spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(&*s.content))
+                .sum();
+            let gap = row_w
+                .saturating_sub(used + UnicodeWidthStr::width(status))
+                .max(2);
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(status, style));
             ListItem::new(Line::from(spans))
         })
         .collect();
 
     let list = List::new(items)
-        .block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .title(" profiles ".to_string()),
-        )
-        .highlight_style(Style::default().bg(Color::Rgb(38, 44, 58)))
-        .highlight_symbol("▶ ");
+        .block(block)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▌ ");
 
     let mut state = ListState::default();
-    state.select(Some(app.selected));
+    state.select(Some(app.selected.min(app.profiles.profiles.len() - 1)));
     f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_details(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(" 详情 ".to_string());
+        .border_style(s_dim())
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("详情", s_bold()),
+            Span::raw(" "),
+        ]));
+
+    let inner = area.width.saturating_sub(2) as usize;
+    let label_w = 10usize;
+    let value_w = inner.saturating_sub(label_w + 2).max(8);
     let mut lines: Vec<Line> = Vec::new();
 
     match app.current() {
-        None => lines.push(Line::from(Span::styled(
-            "  没有 profile。按 a 新增一个。",
-            Style::default().fg(Color::Yellow),
-        ))),
+        None => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  没有可显示的 profile", s_dim())));
+        }
         Some(p) => {
+            kv(&mut lines, "id", p.id.clone(), s_bold(), label_w, value_w);
             kv(
                 &mut lines,
-                "id",
-                p.id.clone(),
-                Style::default().fg(Color::White),
+                "名称",
+                p.label.clone(),
+                Style::default(),
+                label_w,
+                value_w,
             );
-            kv(&mut lines, "名称", p.label.clone(), Style::default());
             kv(
                 &mut lines,
                 "认证",
@@ -771,7 +915,9 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
                     AuthKind::Chatgpt => "ChatGPT 账号（OAuth）".to_string(),
                     AuthKind::Apikey => "API Key".to_string(),
                 },
-                Style::default().fg(Color::Cyan),
+                s_accent(),
+                label_w,
+                value_w,
             );
             kv(
                 &mut lines,
@@ -782,6 +928,8 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
                     p.provider.clone()
                 },
                 Style::default(),
+                label_w,
+                value_w,
             );
             kv(
                 &mut lines,
@@ -792,6 +940,8 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
                     p.base_url.clone()
                 },
                 Style::default(),
+                label_w,
+                value_w,
             );
             kv(
                 &mut lines,
@@ -802,6 +952,8 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
                     p.model.clone()
                 },
                 Style::default(),
+                label_w,
+                value_w,
             );
             if !p.reasoning_effort.is_empty() {
                 kv(
@@ -809,14 +961,8 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
                     "reasoning",
                     p.reasoning_effort.clone(),
                     Style::default(),
-                );
-            }
-            if !p.is_official() {
-                kv(
-                    &mut lines,
-                    "wire_api",
-                    p.wire_api.clone(),
-                    Style::default().fg(Color::DarkGray),
+                    label_w,
+                    value_w,
                 );
             }
             let key_text = if p.auth == AuthKind::Apikey {
@@ -826,54 +972,61 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 "缺少登录态，需要 codex login".to_string()
             };
-            kv(
-                &mut lines,
-                "凭据",
-                key_text,
-                Style::default().fg(Color::Gray),
-            );
+            kv(&mut lines, "凭据", key_text, s_dim(), label_w, value_w);
             kv(
                 &mut lines,
                 "历史标记",
                 p.history_provider().to_string(),
-                Style::default().fg(Color::DarkGray),
+                s_dim(),
+                label_w,
+                value_w,
             );
 
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  环境",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )));
+            section(&mut lines, "环境");
             kv(
                 &mut lines,
                 "CODEX_HOME",
                 paths::codex_home().display().to_string(),
-                Style::default().fg(Color::DarkGray),
+                s_dim(),
+                label_w,
+                value_w,
             );
-            let (n, bytes) = backup::usage();
             kv(
                 &mut lines,
                 "备份",
-                format!("{n} 个目录 · {}", backup::human(bytes)),
-                Style::default().fg(Color::DarkGray),
+                format!(
+                    "{} 个快照 · {}",
+                    app.backups.0,
+                    backup::human(app.backups.1)
+                ),
+                s_dim(),
+                label_w,
+                value_w,
+            );
+            kv(
+                &mut lines,
+                "进程",
+                app.procs.describe(),
+                s_dim(),
+                label_w,
+                value_w,
             );
         }
     }
 
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_log(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(" 日志 ".to_string());
+        .border_style(s_dim())
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("日志", s_bold()),
+            Span::raw(" "),
+        ]));
+    let inner_w = area.width.saturating_sub(4) as usize;
     let height = area.height.saturating_sub(2) as usize;
     let start = app.log.len().saturating_sub(height);
     let lines: Vec<Line> = app.log[start..]
@@ -885,9 +1038,9 @@ fn draw_log(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(tag, style),
                 Span::raw(" "),
                 Span::styled(
-                    m.text.clone(),
+                    fit(&m.text, inner_w),
                     if m.level == Level::Note {
-                        Style::default().fg(Color::Gray)
+                        s_dim()
                     } else {
                         Style::default()
                     },
@@ -899,100 +1052,83 @@ fn draw_log(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let key = |k: &'static str| Span::styled(k.to_string(), Style::default().fg(Color::Cyan));
-    let sep = || Span::styled("  ", Style::default());
-    let text = match app.mode {
-        Mode::Browse => Line::from(vec![
+    let hint = |k: &'static str, label: &'static str| {
+        vec![
+            Span::styled(k, s_accent()),
             Span::raw(" "),
-            key("↑↓"),
-            Span::raw(" 选择"),
-            sep(),
-            key("Enter"),
-            Span::raw(" 切换"),
-            sep(),
-            key("e"),
-            Span::raw(" 设 Key"),
-            sep(),
-            key("a"),
-            Span::raw(" 新增"),
-            sep(),
-            key("h"),
-            Span::raw(" 迁移历史"),
-            sep(),
-            key("v"),
-            Span::raw(" 校验"),
-            sep(),
-            key("b"),
-            Span::raw(" 备份"),
-            sep(),
-            key("u"),
-            Span::raw(" 回滚"),
-            sep(),
-            key("?"),
-            Span::raw(" 帮助"),
-            sep(),
-            key("q"),
-            Span::raw(" 退出"),
-        ]),
-        Mode::Confirm(_) => Line::from(vec![
-            Span::raw(" "),
-            key("Y"),
-            Span::raw(" 确认"),
-            sep(),
-            key("N"),
-            Span::raw(" 取消"),
-        ]),
-        Mode::Form(_) => Line::from(vec![
-            Span::raw(" "),
-            key("Tab"),
-            Span::raw(" 切换字段"),
-            sep(),
-            key("Enter"),
-            Span::raw(" 保存"),
-            sep(),
-            key("Esc"),
-            Span::raw(" 取消"),
-        ]),
+            Span::styled(label, s_dim()),
+        ]
     };
-    f.render_widget(Paragraph::new(text), area);
+
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    let seq: Vec<(&'static str, &'static str)> = match app.mode {
+        Mode::Browse if area.width >= 92 => vec![
+            ("↑↓", "选择"),
+            ("Enter", "切换"),
+            ("e", "设 Key"),
+            ("a", "新增"),
+            ("h", "迁移历史"),
+            ("v", "校验"),
+            ("b", "备份"),
+            ("u", "回滚"),
+            ("?", "帮助"),
+            ("q", "退出"),
+        ],
+        Mode::Browse => vec![
+            ("↑↓", "选择"),
+            ("Enter", "切换"),
+            ("a", "新增"),
+            ("h", "迁移"),
+            ("?", "帮助"),
+            ("q", "退出"),
+        ],
+        Mode::Confirm(_) => vec![("Y", "确认"), ("N", "取消")],
+        Mode::Form(_) => vec![("Tab", "切换字段"), ("Enter", "保存"), ("Esc", "取消")],
+        Mode::Help => vec![("Esc", "关闭帮助")],
+    };
+    for (i, (k, label)) in seq.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("   ", s_dim()));
+        }
+        spans.extend(hint(k, label));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_confirm(f: &mut Frame, c: &Confirm) {
-    let width = 66u16.min(f.area().width.saturating_sub(4));
-    let height = (c.body.len() as u16 + 5).min(f.area().height.saturating_sub(2));
+    let width = 68u16.min(f.area().width.saturating_sub(4));
+    let height = (c.body.len() as u16 + 7).min(f.area().height.saturating_sub(2));
     let area = centered(f.area(), width, height);
     f.render_widget(Clear, area);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let inner_w = area.width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = vec![Line::from("")];
     for b in &c.body {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(b.clone(), Style::default().fg(Color::Gray)),
+            Span::styled(fit(b, inner_w), Style::default()),
         ]));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled(
-            "Y",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" 确认    "),
-        Span::styled(
-            "N",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" 取消"),
+        Span::styled(" Y ", s_pill().fg(Color::Green)),
+        Span::raw("  确认"),
+        Span::raw("        "),
+        Span::styled(" N ", s_pill().fg(Color::Red)),
+        Span::raw("  取消"),
     ]));
 
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Paragraph::new(lines).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(format!(" {} ", c.title)),
+                .border_style(s_warn())
+                .title(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(c.title.clone(), s_bold()),
+                    Span::raw(" "),
+                ])),
         ),
         area,
     );
@@ -1000,11 +1136,12 @@ fn draw_confirm(f: &mut Frame, c: &Confirm) {
 
 fn draw_form(f: &mut Frame, form: &Form) {
     let width = 72u16.min(f.area().width.saturating_sub(4));
-    let height = (form.fields.len() as u16 + 6).min(f.area().height.saturating_sub(2));
+    let height = (form.fields.len() as u16 + 7).min(f.area().height.saturating_sub(2));
     let area = centered(f.area(), width, height);
     f.render_widget(Clear, area);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let inner_w = area.width.saturating_sub(6) as usize;
+    let mut lines: Vec<Line> = vec![Line::from("")];
     for (i, field) in form.fields.iter().enumerate() {
         let focused = i == form.focus;
         let shown = if field.secret && !field.value.is_empty() {
@@ -1015,31 +1152,86 @@ fn draw_form(f: &mut Frame, form: &Form) {
             field.value.clone()
         };
         let style = if focused {
-            Style::default().fg(Color::White).bg(Color::Rgb(38, 44, 58))
+            s_pill()
+        } else if field.value.is_empty() {
+            s_dim()
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default()
         };
         lines.push(Line::from(vec![
             Span::raw(if focused { " ▸ " } else { "   " }),
-            Span::styled(
-                format!("{:<10}", field.label),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(shown, style),
+            Span::styled(pad(field.label, 10), s_dim()),
+            Span::styled(fit(&shown, inner_w.saturating_sub(13)), style),
         ]));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled(form.hint.clone(), Style::default().fg(Color::DarkGray)),
+        Span::styled(fit(&form.hint, inner_w), s_dim()),
+    ]));
+
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(s_accent())
+                .title(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(form.title.clone(), s_bold()),
+                    Span::raw(" "),
+                ])),
+        ),
+        area,
+    );
+}
+
+fn draw_help(f: &mut Frame) {
+    let width = 74u16.min(f.area().width.saturating_sub(4));
+    let rows: Vec<(&str, &str)> = vec![
+        ("↑ ↓ / k j", "上下选择（g / G 跳到首尾）"),
+        ("Enter", "切换到选中的 profile"),
+        ("e", "设置当前 profile 的 API Key"),
+        ("a", "新增一个 profile"),
+        ("h", "把历史会话迁移到当前 profile 的 provider"),
+        ("v", "校验会话字节偏移是否仍然对齐"),
+        ("b", "手动备份 auth / config / sqlite"),
+        ("u", "回滚上一次历史迁移"),
+        ("R", "从最近一次备份整体还原"),
+        ("r", "重新读取配置与进程状态"),
+        ("?", "打开 / 关闭这份帮助"),
+        ("q / Esc", "退出"),
+    ];
+    let height = (rows.len() as u16 + 7).min(f.area().height.saturating_sub(2));
+    let area = centered(f.area(), width, height);
+    f.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+    for (key, desc) in rows {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(pad(key, 12), s_accent()),
+            Span::styled(desc, Style::default()),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "字体由终端决定：codex-switch font --face \"HarmonyOS Sans SC\"",
+            s_dim(),
+        ),
     ]));
 
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" {} ", form.title)),
+                .border_style(s_accent())
+                .title(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled("按键", s_bold()),
+                    Span::raw(" "),
+                ])),
         ),
         area,
     );
@@ -1047,19 +1239,35 @@ fn draw_form(f: &mut Frame, form: &Form) {
 
 fn level_style(level: Level) -> (&'static str, Style) {
     match level {
-        Level::Step => ("→", Style::default().fg(Color::Cyan)),
-        Level::Ok => ("✓", Style::default().fg(Color::Green)),
-        Level::Warn => ("!", Style::default().fg(Color::Yellow)),
-        Level::Err => ("✗", Style::default().fg(Color::Red)),
-        Level::Note => ("·", Style::default().fg(Color::DarkGray)),
+        Level::Step => ("→", s_accent()),
+        Level::Ok => ("✓", s_ok()),
+        Level::Warn => ("!", s_warn()),
+        Level::Err => ("✗", s_err()),
+        Level::Note => ("·", s_dim()),
     }
 }
 
-fn kv(lines: &mut Vec<Line<'static>>, key: &str, value: String, style: Style) {
+fn kv(
+    lines: &mut Vec<Line<'static>>,
+    key: &'static str,
+    value: String,
+    style: Style,
+    label_w: usize,
+    value_w: usize,
+) {
     lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(pad(key, label_w), s_dim()),
         Span::raw("  "),
-        Span::styled(format!("{key:<18}"), Style::default().fg(Color::DarkGray)),
-        Span::styled(value, style),
+        Span::styled(fit(&value, value_w), style),
+    ]));
+}
+
+fn section(lines: &mut Vec<Line<'static>>, title: &'static str) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(title, s_dim_bold()),
     ]));
 }
 
@@ -1074,12 +1282,41 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+/// Pad to a display width, counting a CJK glyph as two cells.
+fn pad(s: &str, w: usize) -> String {
+    let cur = UnicodeWidthStr::width(s);
+    if cur >= w {
         s.to_string()
     } else {
-        s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+        format!("{s}{}", " ".repeat(w - cur))
     }
+}
+
+/// Truncate to a display width, appending an ellipsis.
+fn fit(s: &str, w: usize) -> String {
+    if UnicodeWidthStr::width(s) <= w {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut cur = 0;
+    for ch in s.chars() {
+        let mut buf = [0u8; 4];
+        let cw = UnicodeWidthStr::width(ch.encode_utf8(&mut buf));
+        if cur + cw + 1 > w {
+            break;
+        }
+        out.push(ch);
+        cur += cw;
+    }
+    out.push('…');
+    out
+}
+
+fn line_width(spans: &[Span]) -> usize {
+    spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(&*s.content))
+        .sum()
 }
 
 #[cfg(test)]
@@ -1126,6 +1363,8 @@ mod tests {
             status: "就绪".to_string(),
             mode: Mode::Browse,
             quit: false,
+            procs: RunningProcs::default(),
+            backups: (2, 1024 * 1024),
         }
     }
 
@@ -1148,20 +1387,108 @@ mod tests {
             .collect()
     }
 
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
     #[test]
     fn browse_view_lists_profiles_and_details() {
         let text = render(&demo_app(), 100, 32);
         assert!(has(&text, "codex-switch"), "标题没有渲染");
         assert!(has(&text, "official"), "缺少 official");
         assert!(has(&text, "relay.example.com"), "详情面板没有 base_url");
-        assert!(has(&text, "迁移历史"), "底部按键提示缺失");
+        assert!(has(&text, "切换"), "底部按键提示缺失");
     }
 
     #[test]
     fn narrow_terminal_does_not_panic() {
-        // 40x12 is roughly the smallest usable size; the layout must clamp.
         let _ = render(&demo_app(), 40, 12);
         let _ = render(&demo_app(), 20, 8);
+    }
+
+    // -- input routing -----------------------------------------------------
+    // Regression: the mode a handler set used to be overwritten by the caller,
+    // so Enter / a / e / h / u / R looked like dead keys.
+
+    #[test]
+    fn enter_on_inactive_profile_opens_confirm() {
+        let mut app = demo_app();
+        app.selected = 0; // official, not active
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Confirm(_)), "Enter 没有弹出确认框");
+    }
+
+    #[test]
+    fn letter_a_opens_form() {
+        let mut app = demo_app();
+        press(&mut app, KeyCode::Char('a'));
+        assert!(matches!(app.mode, Mode::Form(_)), "a 没有打开新增表单");
+    }
+
+    #[test]
+    fn letter_e_opens_key_form() {
+        let mut app = demo_app();
+        press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(app.mode, Mode::Form(_)), "e 没有打开 Key 表单");
+    }
+
+    #[test]
+    fn letter_q_quits_and_esc_closes_popup() {
+        let mut app = demo_app();
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Browse), "Esc 没有关闭弹窗");
+        assert!(!app.quit, "Esc 在弹窗里不该退出程序");
+
+        let mut app = demo_app();
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit, "q 没有退出");
+    }
+
+    #[test]
+    fn help_toggles() {
+        let mut app = demo_app();
+        press(&mut app, KeyCode::Char('?'));
+        assert!(matches!(app.mode, Mode::Help));
+        assert!(has(&render(&app, 100, 32), "按键"), "帮助面板没有渲染");
+        press(&mut app, KeyCode::Char('?'));
+        assert!(matches!(app.mode, Mode::Browse));
+    }
+
+    #[test]
+    fn form_accepts_typing() {
+        let mut app = demo_app();
+        press(&mut app, KeyCode::Char('e'));
+        for ch in "sk-abc".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        match &app.mode {
+            Mode::Form(f) => assert_eq!(f.fields[0].value, "sk-abc"),
+            _ => panic!("表单被意外关闭"),
+        }
+    }
+
+    #[test]
+    fn arrows_move_selection_within_bounds() {
+        let mut app = demo_app();
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.selected, 0);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.selected, 0, "上边界越界");
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.selected, 1);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected, 1, "下边界越界");
+    }
+
+    // -- layout ------------------------------------------------------------
+
+    #[test]
+    fn wide_text_pads_by_display_width() {
+        assert_eq!(UnicodeWidthStr::width(pad("认证", 10).as_str()), 10);
+        assert_eq!(UnicodeWidthStr::width(pad("provider", 10).as_str()), 10);
+        assert_eq!(fit("中文内容很长很长", 6), "中文…");
+        assert_eq!(UnicodeWidthStr::width(fit(&"中".repeat(20), 9).as_str()), 9);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod auth;
 mod backup;
 mod config_edit;
+mod font;
 mod history;
 mod paths;
 mod profile;
@@ -31,6 +32,13 @@ fn main() {
 
 fn run() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // `font --face <name>` carries its own flags. Route it before the global
+    // option parser, which would reject the leading dashes.
+    if argv.first().map(|s| s.as_str()) == Some("font") {
+        return cmd_font(&argv[1..]);
+    }
+
     let mut opts = Opts::default();
     let mut positional: Vec<String> = Vec::new();
 
@@ -87,11 +95,50 @@ fn run() -> Result<()> {
 
 fn print_help() {
     println!(
-        "{}\n\n{}\n  codex-switch                     打开 TUI（可视界面）\n  codex-switch tui                 同上\n  codex-switch menu                纯文本交互菜单（不支持 TUI 的终端用）\n  codex-switch list                列出所有 profile\n  codex-switch status              当前配置与凭据状态\n  codex-switch use <id>            切换到某个 profile\n  codex-switch history [id]        只迁移历史会话到目标 provider\n  codex-switch rollback [dir]      回滚最近一次历史迁移\n  codex-switch add <id> --base-url <url> [--model <m>] [--auth apikey|chatgpt]\n  codex-switch key <id>            设置某个 profile 的 API Key\n  codex-switch backup              手动备份 auth/config/sqlite\n  codex-switch clean               清理旧备份快照（保留迁移记录）\n  codex-switch restore [dir]       从备份还原\n  codex-switch verify              校验会话偏移是否仍然对齐\n  codex-switch doctor              环境自检\n  codex-switch import              从当前 config.toml / auth.json 重新导入 profile\n\n{}\n  -n, --dry-run    只显示计划，不写任何文件\n  -y, --yes        跳过确认\n      --no-history 切换时不迁移历史会话\n  -f, --force      Codex 正在运行时也继续（风险自负）",
+        "{}\n\n{}",
         ui::bold("codex-switch —— Codex 登录方式与供应商一键切换"),
-        ui::bold("用法:"),
-        ui::bold("选项:")
+        ui::bold("用法:")
     );
+    for line in [
+        "  codex-switch                     打开 TUI（可视界面）",
+        "  codex-switch tui                 同上",
+        "  codex-switch menu                纯文本交互菜单（不支持 TUI 的终端用）",
+        "  codex-switch list                列出所有 profile",
+        "  codex-switch status              当前配置与凭据状态",
+        "  codex-switch use <id>            切换到某个 profile",
+        "  codex-switch history [id]        只迁移历史会话到目标 provider",
+        "  codex-switch rollback [dir]      回滚最近一次历史迁移",
+        "  codex-switch add <id> --base-url <url> [--model <m>] [--auth apikey|chatgpt]",
+        "  codex-switch key <id>            设置某个 profile 的 API Key",
+        "  codex-switch backup              手动备份 auth/config/sqlite",
+        "  codex-switch clean               清理旧备份快照（保留迁移记录）",
+        "  codex-switch restore [dir]       从备份还原",
+        "  codex-switch verify              校验会话偏移是否仍然对齐",
+        "  codex-switch doctor              环境自检",
+        "  codex-switch import              从当前 config.toml / auth.json 重新导入 profile",
+    ] {
+        println!("{line}");
+    }
+
+    println!("\n{}", ui::bold("字体"));
+    for line in [
+        "  codex-switch font                查看当前终端字体与配置文件位置",
+        "  codex-switch font --list         列出系统已安装的字体",
+        "  codex-switch font --face <名称>  切换 Windows Terminal 的字体",
+        "  codex-switch font --restore      还原上一次字体修改",
+    ] {
+        println!("{line}");
+    }
+
+    println!("\n{}", ui::bold("选项:"));
+    for line in [
+        "  -n, --dry-run    只显示计划，不写任何文件",
+        "  -y, --yes        跳过确认",
+        "      --no-history 切换时不迁移历史会话",
+        "  -f, --force      Codex 正在运行时也继续（风险自负）",
+    ] {
+        println!("{line}");
+    }
 }
 
 fn load() -> Result<(Profiles, Keys)> {
@@ -719,4 +766,194 @@ fn cmd_import(opts: Opts) -> Result<()> {
         existing.profiles.len()
     );
     Ok(())
+}
+
+/// `codex-switch font`: the one terminal setting a TUI cannot make for itself.
+fn cmd_font(args: &[String]) -> Result<()> {
+    let mut face: Option<String> = None;
+    let mut restore = false;
+    let mut dry_run = false;
+    let mut yes = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--face" | "-f" => {
+                face = Some(args.get(i + 1).context("--face 缺少字体名")?.clone());
+                i += 2;
+            }
+            "--restore" => {
+                restore = true;
+                i += 1;
+            }
+            "--dry-run" | "-n" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--yes" | "-y" => {
+                yes = true;
+                i += 1;
+            }
+            "--list" => {
+                let Some(list) = font::installed_faces() else {
+                    bail!("读取字体列表仅支持 Windows");
+                };
+                println!("\n{}", ui::bold("已安装的字体"));
+                for name in list {
+                    println!("  {name}");
+                }
+                println!();
+                return Ok(());
+            }
+            other => bail!(
+                "font: 未知参数 {other}\n用法: codex-switch font [--face <名称>] [--list] [--restore]"
+            ),
+        }
+    }
+
+    let Some(path) = font::locate() else {
+        println!(
+            "\n{} 没找到 Windows Terminal 的 settings.json。",
+            ui::yellow("提示:")
+        );
+        println!(
+            "  手动设置：设置 → 配置文件 → 默认值 → 外观 → 字体 → {}",
+            font::DEFAULT_FACE
+        );
+        println!("  其他终端（WezTerm / Alacritty / iTerm2）请改各自的配置文件。\n");
+        return Ok(());
+    };
+
+    let src = std::fs::read_to_string(&path).with_context(|| format!("读取 {}", path.display()))?;
+    let current = font::current_face(&src)?.unwrap_or_else(|| "<未设置>".to_string());
+
+    if restore {
+        let Some(file) = latest_wt_backup() else {
+            bail!("没有字体设置的备份（backups/wt-settings-*.json）");
+        };
+        if dry_run {
+            println!("会把 {} 还原到 {}", file.display(), path.display());
+            return Ok(());
+        }
+        if !yes
+            && !ui::confirm(
+                &format!("用 {} 覆盖当前 settings.json？", file.display()),
+                true,
+            )?
+        {
+            return Ok(());
+        }
+        std::fs::copy(&file, &path).with_context(|| format!("还原 {}", path.display()))?;
+        println!(
+            "{} 字体设置已还原，Windows Terminal 会自动重载",
+            ui::green("✓")
+        );
+        println!("  {}", ui::dim(&file.display().to_string()));
+        return Ok(());
+    }
+
+    println!("\n{}", ui::bold("终端字体"));
+    println!("  配置文件   {}", path.display());
+    println!("  当前字体   {}", ui::cyan(&current));
+    if let Some(t) = &face {
+        println!("  目标字体   {}", ui::cyan(t));
+    }
+    if std::env::var("WT_SESSION")
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
+    {
+        println!(
+            "\n  {} 当前不在 Windows Terminal 会话里；双击 exe 打开的系统控制台不读这份配置。",
+            ui::yellow("注意:")
+        );
+    }
+
+    let Some(target) = face else {
+        println!(
+            "\n{}\n  codex-switch font --face \"{}\"\n  codex-switch font --list\n",
+            ui::dim("切换字体:"),
+            font::DEFAULT_FACE
+        );
+        return Ok(());
+    };
+
+    if target == current {
+        println!("\n{} 已经是这个字体了", ui::green("✓"));
+        return Ok(());
+    }
+
+    // Pure: validates that the setting exists and that the splice round-trips.
+    let updated = font::set_face(&src, &target)?;
+
+    if font::face_installed(&target) == Some(false) {
+        println!(
+            "\n  {} 系统里没找到字体 `{}`，Windows Terminal 会静默回退到默认字体。",
+            ui::yellow("警告:"),
+            target
+        );
+    }
+
+    if dry_run {
+        println!(
+            "\n{} 只演练，未写入。settings.json 里的这一行会变成：",
+            ui::yellow("--dry-run：")
+        );
+        println!("  \"face\": \"{target}\"");
+        return Ok(());
+    }
+
+    if !yes && !ui::confirm(&format!("\n把终端字体改成 `{target}`？"), true)? {
+        println!("{}", ui::dim("已取消"));
+        return Ok(());
+    }
+
+    let dir = paths::backup_root();
+    std::fs::create_dir_all(&dir).with_context(|| format!("创建 {}", dir.display()))?;
+    let backup = dir.join(format!("wt-settings-{}.json", paths::timestamp()));
+    std::fs::copy(&path, &backup).with_context(|| format!("备份 {}", path.display()))?;
+    paths::atomic_write(&path, updated.as_bytes())?;
+
+    println!("\n{} 字体已切换为 {}", ui::green("✓"), ui::cyan(&target));
+    println!("  {} {}", ui::dim("备份"), backup.display());
+    println!(
+        "  {}",
+        ui::dim("Windows Terminal 会自动重载；已打开的标签页可能要新开一个才用上新字体。")
+    );
+    if is_proportional(&target) {
+        println!(
+            "\n  {} 这不是等宽字体，字符宽度不一致，表格列与边框可能对不齐。",
+            ui::yellow("提醒:")
+        );
+        println!(
+            "  {}",
+            ui::dim("终端里更稳妥的是等宽 CJK 字体，例如 Sarasa Mono SC / Maple Mono NF CN。")
+        );
+    }
+    println!();
+    Ok(())
+}
+
+/// Known proportional CJK families. Anything with `Mono` in the name is left
+/// alone; the list only exists to warn, never to block.
+fn is_proportional(face: &str) -> bool {
+    let f = face.to_ascii_lowercase();
+    (f.starts_with("harmonyos sans")
+        || f.starts_with("source han sans")
+        || f.starts_with("noto sans cjk"))
+        && !f.contains("mono")
+}
+
+fn latest_wt_backup() -> Option<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(paths::backup_root())
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().starts_with("wt-settings-"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files.pop()
 }

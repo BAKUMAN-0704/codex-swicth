@@ -3,11 +3,18 @@
 在 Codex 的 **ChatGPT 账号登录** 与 **API Key / 第三方供应商** 之间一键切换，并且切换后**历史对话照常可见**。
 
 ```text
-  profiles                     详情
-  ▶ ○ official   ChatGPT 登录✓   provider        openai（内置）
-    ● relay      API Key  key ✓   base_url        https://relay.example.com/v1
-                                  model           gpt-5
-                                  # 历史标记      relay
+ codex-switch 0.2.1   relay  ·  仅 API Key（sk-…）           ● Codex 未运行
+──────────────────────────────────────────────────────────────────────────────
+╭ profiles ────────────────────╮╭ 详情 ─────────────────────────────────────╮
+│  ○ official       ChatGPT  需登录 │ id          relay                      │
+│▌ ● relay          API Key  key ✓  │ 认证        API Key                    │
+│                              ││ base_url    https://relay.example.com/v1  │
+│                              ││ 历史标记    relay                      │
+╰──────────────────────────────╯╰───────────────────────────────────────────╯
+╭ 日志 ───────────────────────────────────────────────────────────────────────╮
+│ ✓ config.toml 已更新                                                        │
+╰─────────────────────────────────────────────────────────────────────────────╯
+ ↑↓ 选择   Enter 切换   e 设 Key   a 新增   h 迁移历史   v 校验   b 备份   ? 帮助   q 退出
 ```
 
 ## 它解决什么问题
@@ -44,6 +51,7 @@ codex-switch
 | 按键 | 作用 |
 | --- | --- |
 | `↑` `↓` / `j` `k` | 选择 profile |
+| `g` / `G` | 跳到列表首 / 尾 |
 | `Enter` | 切换（会先列出将要写入的每一项） |
 | `e` | 设置选中 profile 的 API Key |
 | `a` | 新增 profile |
@@ -52,7 +60,9 @@ codex-switch
 | `b` | 手动备份 |
 | `u` | 回滚上一次历史迁移 |
 | `R` | 从最近备份还原 config/auth/sqlite |
-| `q` | 退出 |
+| `r` | 重新读取配置与进程状态 |
+| `?` | 打开 / 关闭按键说明 |
+| `q` / `Esc` | 退出 |
 
 也完全可以用命令行（适合脚本和 CI）：
 
@@ -70,6 +80,23 @@ codex-switch doctor               # 环境自检
 ```
 
 没有终端（或被管道调用）时 TUI 不会启动，可用 `codex-switch menu` 走纯文本菜单。
+
+## 字体
+
+TUI 自己改不了字体：字符是终端模拟器画出来的，程序只能决定输出什么字符、什么颜色。Windows 上这个设置存在 Windows Terminal 的 `settings.json`，所以单独给了个子命令：
+
+```bash
+codex-switch font                               # 当前字体 + 配置文件位置
+codex-switch font --list                        # 系统已安装的字体
+codex-switch font --face "HarmonyOS Sans SC"    # 切换
+codex-switch font --restore                     # 还原上一次修改
+```
+
+`settings.json` 是带注释的 JSONC。整份解析再序列化会把注释和缩进全删掉，所以这里只定位并替换 `profiles.defaults.font.face` 的那一个字符串字面量，其余字节原样保留；写前备份到 `~/.codex-switch/backups/wt-settings-*.json`，写完还会回读校验，对不上就不落盘。
+
+**关于 HarmonyOS Sans SC**：它不是等宽字体。终端界面按固定字符网格排版，比例字体会让表格列和边框对不齐 —— 中文本身的观感没问题，但列表右侧的状态标记会飘。真要用可以，只是 `Sarasa Mono SC`、`Maple Mono NF CN` 这类等宽 CJK 字体在终端里更稳。
+
+还有一点：如果系统的默认终端仍是旧版控制台（conhost），双击 exe 打开的是 conhost，它不读 Windows Terminal 的配置；这种情况下请从 Windows Terminal 里运行本工具。
 
 ## 每次切换具体改了什么
 
