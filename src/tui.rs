@@ -1217,7 +1217,10 @@ fn draw_help(f: &mut Frame) {
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            "字体由终端决定：codex-switch font --face \"HarmonyOS Sans SC\"",
+            format!(
+                "字体由终端决定：codex-switch font --face \"{}\"",
+                crate::font::DEFAULT_FACE
+            ),
             s_dim(),
         ),
     ]));

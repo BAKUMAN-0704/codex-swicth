@@ -14,8 +14,12 @@ use anyhow::{bail, Context, Result};
 use std::ops::Range;
 use std::path::PathBuf;
 
-/// The face this machine was asked to use; also the default in `font --face`.
-pub const DEFAULT_FACE: &str = "HarmonyOS Sans SC";
+/// Suggested face, also the default of `font --face`.
+///
+/// Must be monospaced: the TUI lays out a fixed character grid, and a
+/// proportional face drifts the columns apart. `--face` takes any name, so
+/// this is a starting point rather than a constraint.
+pub const DEFAULT_FACE: &str = "JetBrainsMono NFM";
 
 pub fn locate() -> Option<PathBuf> {
     #[cfg(windows)]
@@ -343,7 +347,37 @@ pub fn installed_faces() -> Option<Vec<String>> {
 }
 
 pub fn face_installed(face: &str) -> Option<bool> {
-    installed_faces().map(|list| list.iter().any(|f| f.eq_ignore_ascii_case(face)))
+    installed_faces().map(|list| list.iter().any(|f| face_matches(f, face)))
+}
+
+/// Whether a registry entry names the same family as `face`.
+///
+/// Windows appends the style to single-face families, so the entry is
+/// `JetBrainsMono NFM Regular` while Windows Terminal wants
+/// `JetBrainsMono NFM`. Comparing the raw strings would report every such
+/// font as missing and print a bogus warning.
+fn face_matches(entry: &str, face: &str) -> bool {
+    if entry.eq_ignore_ascii_case(face) {
+        return true;
+    }
+    family(entry).eq_ignore_ascii_case(face)
+}
+
+const STYLES: [&str; 9] = [
+    "regular", "bold", "italic", "light", "medium", "thin", "semibold", "black", "oblique",
+];
+
+/// Drop trailing style words: `Foo SemiBold Italic` -> `Foo`.
+fn family(entry: &str) -> &str {
+    let mut name = entry.trim();
+    while let Some((head, tail)) = name.rsplit_once(' ') {
+        if STYLES.iter().any(|s| s.eq_ignore_ascii_case(tail)) {
+            name = head.trim_end();
+        } else {
+            break;
+        }
+    }
+    name
 }
 
 #[cfg(test)]
@@ -378,10 +412,10 @@ mod tests {
 
     #[test]
     fn replaces_only_the_face_literal() {
-        let out = set_face(SAMPLE, "HarmonyOS Sans SC").unwrap();
+        let out = set_face(SAMPLE, "Sarasa Mono SC").unwrap();
         assert_eq!(
             current_face(&out).unwrap().as_deref(),
-            Some("HarmonyOS Sans SC")
+            Some("Sarasa Mono SC")
         );
         assert!(out.contains("// Windows Terminal settings"), "注释被删了");
         assert!(out.contains("\"size\": 11"), "相邻字段被破坏");
@@ -391,25 +425,27 @@ mod tests {
         );
         assert_eq!(
             out.len(),
-            SAMPLE.len() - "0xProto Nerd Font Mono".len() + "HarmonyOS Sans SC".len()
+            SAMPLE.len() - "0xProto Nerd Font Mono".len() + "Sarasa Mono SC".len()
         );
     }
 
     #[test]
     fn missing_face_is_an_error_not_a_rewrite() {
         let src = r#"{ "profiles": { "defaults": { "opacity": 34 } } }"#;
-        assert!(set_face(src, "HarmonyOS Sans SC").is_err());
+        assert!(set_face(src, "Sarasa Mono SC").is_err());
     }
 
     #[test]
     fn crlf_and_unicode_keys_are_preserved() {
         let src = "{\r\n  \"profiles\": {\r\n    \"defaults\": {\r\n      \"font\": {\r\n        \"face\": \"Cascadia Mono\"\r\n      }\r\n    }\r\n  },\r\n  \"名称\": \"命令提示符\"\r\n}\r\n";
-        let out = set_face(src, "HarmonyOS Sans SC").unwrap();
+        // A non-ASCII face name: the splice works on byte spans, so this
+        // guards the arithmetic against multi-byte characters.
+        let out = set_face(src, "等距更纱黑体 SC").unwrap();
         assert!(out.contains("\r\n"), "换行符被改成了 LF");
         assert!(out.contains("命令提示符"), "中文内容受损");
         assert_eq!(
             current_face(&out).unwrap().as_deref(),
-            Some("HarmonyOS Sans SC")
+            Some("等距更纱黑体 SC")
         );
     }
 
@@ -428,5 +464,27 @@ mod tests {
         let out = set_face(src, "G").unwrap();
         assert!(out.starts_with('\u{feff}'), "BOM 被吃掉了");
         assert_eq!(current_face(&out).unwrap().as_deref(), Some("G"));
+    }
+
+    #[test]
+    fn registry_style_suffix_still_counts_as_installed() {
+        // The registry names single-face families "<family> <style>"; the
+        // terminal wants the bare family. This used to warn "not installed"
+        // for perfectly good fonts.
+        assert!(face_matches(
+            "JetBrainsMono NFM Regular",
+            "JetBrainsMono NFM"
+        ));
+        assert!(face_matches(
+            "JetBrainsMono NFM SemiBold Italic",
+            "JetBrainsMono NFM"
+        ));
+        assert!(face_matches("Cascadia Mono", "Cascadia Mono"));
+        assert!(!face_matches("JetBrainsMono NFM", "JetBrainsMono NF"));
+        assert!(!face_matches("JetBrainsMono NF", "JetBrainsMono NFM"));
+        assert_eq!(
+            family("0xProto Nerd Font Mono Light"),
+            "0xProto Nerd Font Mono"
+        );
     }
 }

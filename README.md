@@ -88,13 +88,13 @@ TUI 自己改不了字体：字符是终端模拟器画出来的，程序只能�
 ```bash
 codex-switch font                               # 当前字体 + 配置文件位置
 codex-switch font --list                        # 系统已安装的字体
-codex-switch font --face "HarmonyOS Sans SC"    # 切换
+codex-switch font --face "JetBrainsMono NFM"    # 切换
 codex-switch font --restore                     # 还原上一次修改
 ```
 
 `settings.json` 是带注释的 JSONC。整份解析再序列化会把注释和缩进全删掉，所以这里只定位并替换 `profiles.defaults.font.face` 的那一个字符串字面量，其余字节原样保留；写前备份到 `~/.codex-switch/backups/wt-settings-*.json`，写完还会回读校验，对不上就不落盘。
 
-**关于 HarmonyOS Sans SC**：它不是等宽字体。终端界面按固定字符网格排版，比例字体会让表格列和边框对不齐 —— 中文本身的观感没问题，但列表右侧的状态标记会飘。真要用可以，只是 `Sarasa Mono SC`、`Maple Mono NF CN` 这类等宽 CJK 字体在终端里更稳。
+**字体要挑等宽的**：TUI 按固定字符网格排版，比例字体（比如 HarmonyOS Sans SC）会让表格列和边框对不齐，列表右侧的状态标记会飘。`JetBrainsMono NFM`、`Cascadia Mono`、`0xProto Nerd Font Mono` 都是等宽的，装哪个用哪个；中文由系统回退到 Noto Sans SC / 微软雅黑，仍然占满两格，不影响对齐。想让中文也严格等宽，可以装 `Sarasa Mono SC`（等距更纱黑体）或 `Maple Mono NF CN`，再用 `font --face` 切过去。
 
 还有一点：如果系统的默认终端仍是旧版控制台（conhost），双击 exe 打开的是 conhost，它不读 Windows Terminal 的配置；这种情况下请从 Windows Terminal 里运行本工具。
 
