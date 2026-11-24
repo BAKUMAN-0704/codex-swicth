@@ -101,6 +101,14 @@ codex-switch font --restore                     # 还原上一次对 settings.js
 
 `--console` 改的是**当前这个控制台窗口**，同时写进 `~/.codex-switch/window.toml`，所以下次双击 exe 还是这个字体。它会读回校验：如果窗口其实由宿主程序绘制（Windows Terminal、ConPTY），conhost 会接受请求但不生效，这时命令会直接告诉你"窗口没跟着变"，不会假装成功。
 
+**没有那个字体也不会出事**。`window.toml` 里存的是字体名，名字只对装了它的机器有意义，所以这个文件从一开始就不进仓库、也没设默认值 —— 干净机器上不写这个文件，窗口就沿用系统默认字体，什么都不改。只有在你自己设过字体、后来那台机器上没有它时，才会按顺序退到已装的等宽字体：
+
+```
+Sarasa Term SC Nerd → Sarasa Mono SC → Maple Mono NF CN → Cascadia Mono → Consolas → Lucida Console
+```
+
+`Consolas` / `Lucida Console` 从 Vista 起每个 Windows 都自带，所以这条链一定能落地；中文由 conhost 链接系统 CJK 字体补上，仍占两格。**配置不会被改写**：你写的还是原来那个名字，字体装回来就自动生效，`font --console` 会把"已保存 / 当前窗口"两行分开列，一眼能看出是不是回退了。
+
 `settings.json` 是带注释的 JSONC。整份解析再序列化会把注释和缩进全删掉，所以这里只定位并替换 `profiles.defaults.font.face` 的那一个字符串字面量，其余字节原样保留；写前备份到 `~/.codex-switch/backups/wt-settings-*.json`，写完还会回读校验，对不上就不落盘。
 
 **字体要挑等宽的**：TUI 按固定字符网格排版，比例字体（比如 HarmonyOS Sans SC）会让表格列和边框对不齐，列表右侧的状态标记会飘。只有中文等宽的需求，装 `Sarasa Term SC`（更纱黑体，一个 `.ttc` 装完全部字重）或 `Maple Mono NF CN`；不想装就直接用系统自带的 `Cascadia Mono`，中文回退到 Noto Sans SC / 微软雅黑，仍然占满两格，网格不会散。

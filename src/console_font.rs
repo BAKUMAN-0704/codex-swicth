@@ -13,6 +13,10 @@
 //! Inside Windows Terminal the call is a no-op: conhost has no font of its own
 //! there, so the request is accepted and ignored. That is fine — the same exe
 //! needs to work both ways without asking which one it is.
+//!
+//! No font is assumed: the name comes from a per-machine file, and a name this
+//! machine does not have falls through a short list of common fixed pitch faces
+//! (see `FALLBACKS`) rather than failing at startup.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -54,15 +58,91 @@ pub fn save(style: &WindowStyle) -> Result<()> {
     crate::paths::atomic_write(&p, format!("{header}{text}").as_bytes())
 }
 
+/// Faces to fall back to when the remembered one is not on this machine,
+/// best first.
+///
+/// `window.toml` records a *name*, and a name only means something on a
+/// machine that has that font. Another user's box will not have the CJK mono
+/// face you picked, so a missing face degrades instead of failing: the
+/// preference stays on disk, the best installed face is used now, and it
+/// applies again as soon as the font shows up.
+///
+/// conhost needs a fixed pitch face. `Consolas` and `Lucida Console` ship with
+/// every Windows since Vista, so the tail of the list always resolves;
+/// conhost links CJK glyphs from the system CJK font on top of either.
+const FALLBACKS: &[&str] = &[
+    "Sarasa Term SC Nerd",
+    "Sarasa Mono SC",
+    "Maple Mono NF CN",
+    "Cascadia Mono",
+    "Consolas",
+    "Lucida Console",
+];
+
+/// What a startup attempt ended up doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// Nothing configured: the window keeps its own look.
+    NotConfigured,
+    /// The remembered face is in use.
+    AsSaved,
+    /// The remembered face could not be applied; this one was.
+    Fallback { wanted: String, used: String },
+    /// Nothing could be applied; the window keeps its own look.
+    Kept { wanted: String, detail: String },
+}
+
+/// The remembered face first, then the fallbacks, without duplicates.
+fn candidates(wanted: &str) -> Vec<&str> {
+    let mut out = vec![wanted];
+    for face in FALLBACKS {
+        if !out.iter().any(|s| s.eq_ignore_ascii_case(face)) {
+            out.push(face);
+        }
+    }
+    out
+}
+
+/// Apply `style` to the console this process is attached to.
+pub fn apply(style: &WindowStyle) -> Applied {
+    apply_with(style, set)
+}
+
+fn apply_with(style: &WindowStyle, set: impl Fn(&str, Option<i16>) -> Result<()>) -> Applied {
+    let wanted = style.face.trim();
+    if wanted.is_empty() {
+        return Applied::NotConfigured;
+    }
+
+    let mut detail = String::new();
+    let mut first = true;
+    for face in candidates(wanted) {
+        match set(face, style.size) {
+            Ok(()) if first => return Applied::AsSaved,
+            Ok(()) => {
+                return Applied::Fallback {
+                    wanted: wanted.to_string(),
+                    used: face.to_string(),
+                }
+            }
+            // Keep the first error: it explains why the configured face was
+            // not used. The fallbacks failing is the expected shape of "not
+            // installed on this machine".
+            Err(e) if first => detail = format!("{e:#}"),
+            Err(_) => {}
+        }
+        first = false;
+    }
+    Applied::Kept {
+        wanted: wanted.to_string(),
+        detail,
+    }
+}
+
 /// Apply the remembered face to the console this process is attached to.
 /// A no-op when nothing is configured.
-pub fn apply_saved() {
-    let style = load();
-    if !style.is_set() {
-        return;
-    }
-    // Startup must never fail because of cosmetics.
-    let _ = set(&style.face, style.size);
+pub fn apply_saved() -> Applied {
+    apply(&load())
 }
 
 #[cfg(windows)]
@@ -282,5 +362,84 @@ mod tests {
             size: None
         }
         .is_set());
+    }
+
+    #[test]
+    fn candidates_put_the_saved_face_first() {
+        let list = candidates("Sarasa Term SC Nerd");
+        assert_eq!(list[0], "Sarasa Term SC Nerd");
+        assert!(list.len() > 1, "回退列表不该是空的");
+    }
+
+    #[test]
+    fn candidates_do_not_repeat_a_fallback() {
+        // Case-insensitive: Windows face names are matched that way.
+        let list = candidates("consolas");
+        let hits = list
+            .iter()
+            .filter(|f| f.eq_ignore_ascii_case("Consolas"))
+            .count();
+        assert_eq!(hits, 1, "{list:?}");
+    }
+
+    #[test]
+    fn unconfigured_style_is_left_alone() {
+        assert_eq!(apply(&WindowStyle::default()), Applied::NotConfigured);
+        assert_eq!(
+            apply(&WindowStyle {
+                face: "  ".into(),
+                size: None
+            }),
+            Applied::NotConfigured
+        );
+    }
+
+    /// A console that only accepts faces it knows, like conhost on a machine
+    /// where the remembered font was never installed.
+    fn console_with(known: &'static [&'static str]) -> impl Fn(&str, Option<i16>) -> Result<()> {
+        move |face, _| match known.iter().any(|k| k.eq_ignore_ascii_case(face)) {
+            true => Ok(()),
+            false => anyhow::bail!("no such face: {face}"),
+        }
+    }
+
+    fn style(face: &str) -> WindowStyle {
+        WindowStyle {
+            face: face.to_string(),
+            size: None,
+        }
+    }
+
+    #[test]
+    fn a_face_that_is_present_is_used_as_is() {
+        let got = apply_with(&style("Consolas"), console_with(&["Consolas"]));
+        assert_eq!(got, Applied::AsSaved);
+    }
+
+    #[test]
+    fn a_missing_face_falls_back_to_an_installed_one() {
+        let got = apply_with(&style("Somebodys Font"), console_with(&["Consolas"]));
+        assert_eq!(
+            got,
+            Applied::Fallback {
+                wanted: "Somebodys Font".into(),
+                used: "Consolas".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn nothing_installed_keeps_the_window_as_it_was() {
+        let got = apply_with(&style("Somebodys Font"), console_with(&[]));
+        match got {
+            Applied::Kept { wanted, detail } => {
+                assert_eq!(wanted, "Somebodys Font");
+                assert!(
+                    detail.contains("Somebodys Font"),
+                    "报错丢掉了字体名: {detail}"
+                );
+            }
+            other => panic!("期望 Kept，实际 {other:?}"),
+        }
     }
 }

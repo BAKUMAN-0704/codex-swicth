@@ -983,6 +983,13 @@ fn cmd_font_console(face: Option<String>, size: Option<i16>, dry_run: bool) -> R
         "  当前窗口   {}",
         console_font::current_face().unwrap_or_else(|| ui::dim("读不到（不是控制台窗口）"))
     );
+    if style.is_set() && font::face_installed(&style.face) == Some(false) {
+        println!(
+            "  {}\n            本机没装 `{}`：启动不报错，退到已装的等宽字体，配置保留不动",
+            ui::yellow("注意       "),
+            style.face
+        );
+    }
 
     let Some(target) = face else {
         println!(
@@ -1019,9 +1026,16 @@ fn cmd_font_console(face: Option<String>, size: Option<i16>, dry_run: bool) -> R
         paths::window_path().display(),
         target
     );
-    match console_font::set(&style.face, style.size) {
-        Ok(()) => println!("  当前窗口也切过来了"),
-        Err(e) => println!("\n  {}\n  {:#}", ui::yellow("当前窗口没跟着变："), e),
+    match console_font::apply(&style) {
+        console_font::Applied::AsSaved => println!("  当前窗口也切过来了"),
+        console_font::Applied::Fallback { wanted, used } => println!(
+            "  {} 本机没有 `{wanted}`，当前窗口用 `{used}`；配置保留着，装上那个字体就自动生效",
+            ui::yellow("回退:")
+        ),
+        console_font::Applied::Kept { detail, .. } => {
+            println!("\n  {}\n  {detail}", ui::yellow("当前窗口没跟着变："))
+        }
+        console_font::Applied::NotConfigured => {}
     }
     Ok(())
 }
