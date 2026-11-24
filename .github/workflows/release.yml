@@ -4,6 +4,10 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag，例如 v0.2.0"
+        required: true
 
 permissions:
   contents: write
@@ -26,6 +30,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -59,11 +65,13 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # No checkout here, so gh has no git remote to infer the repo from.
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
-            || gh release create "${GITHUB_REF_NAME}" \
-                 --title "${GITHUB_REF_NAME}" --generate-notes
-          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/* --clobber
