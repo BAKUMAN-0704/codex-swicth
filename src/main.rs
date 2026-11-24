@@ -816,10 +816,7 @@ fn cmd_font(args: &[String]) -> Result<()> {
             "\n{} 没找到 Windows Terminal 的 settings.json。",
             ui::yellow("提示:")
         );
-        println!(
-            "  手动设置：设置 → 配置文件 → 默认值 → 外观 → 字体 → {}",
-            font::DEFAULT_FACE
-        );
+        println!("  手动设置：设置 → 配置文件 → 默认值 → 外观 → 字体 → 挑一个等宽字体");
         println!("  其他终端（WezTerm / Alacritty / iTerm2）请改各自的配置文件。\n");
         return Ok(());
     };
@@ -870,9 +867,8 @@ fn cmd_font(args: &[String]) -> Result<()> {
 
     let Some(target) = face else {
         println!(
-            "\n{}\n  codex-switch font --face \"{}\"\n  codex-switch font --list\n",
-            ui::dim("切换字体:"),
-            font::DEFAULT_FACE
+            "\n{}\n  codex-switch font --face \"<字体名>\"\n  codex-switch font --list\n",
+            ui::dim("切换字体（名字从 --list 里挑，要等宽的）:")
         );
         return Ok(());
     };

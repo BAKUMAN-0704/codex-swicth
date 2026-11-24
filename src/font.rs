@@ -11,15 +11,9 @@
 //! again before it is allowed anywhere near the disk.
 
 use anyhow::{bail, Context, Result};
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
-use std::path::PathBuf;
-
-/// Suggested face, also the default of `font --face`.
-///
-/// Must be monospaced: the TUI lays out a fixed character grid, and a
-/// proportional face drifts the columns apart. `--face` takes any name, so
-/// this is a starting point rather than a constraint.
-pub const DEFAULT_FACE: &str = "JetBrainsMono NFM";
+use std::path::{Path, PathBuf};
 
 pub fn locate() -> Option<PathBuf> {
     #[cfg(windows)]
@@ -347,7 +341,29 @@ pub fn installed_faces() -> Option<Vec<String>> {
 }
 
 pub fn face_installed(face: &str) -> Option<bool> {
-    installed_faces().map(|list| list.iter().any(|f| face_matches(f, face)))
+    match installed_faces() {
+        // A `.ttc` is registered once, under the localized names of every
+        // face it holds, joined by " & "; the English family name the
+        // terminal wants may be absent from the registry entirely. So a
+        // registry miss only sends us to the files, it does not decide.
+        Some(list) if !list.iter().any(|e| entry_matches(e, face)) => {}
+        Some(_) => return Some(true),
+        None => return None,
+    }
+    let files = installed_font_files();
+    if files.is_empty() {
+        return Some(false);
+    }
+    Some(
+        files
+            .iter()
+            .any(|p| families_in_file(p).iter().any(|f| face_matches(f, face))),
+    )
+}
+
+/// One registry entry can describe several faces: `A Bold & A Italic`.
+fn entry_matches(entry: &str, face: &str) -> bool {
+    entry.split(" & ").any(|part| face_matches(part, face))
 }
 
 /// Whether a registry entry names the same family as `face`.
@@ -378,6 +394,162 @@ fn family(entry: &str) -> &str {
         }
     }
     name
+}
+
+/// Font files installed for this user and for all users.
+fn installed_font_files() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        dirs.push(
+            PathBuf::from(local)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Fonts"),
+        );
+    }
+    if let Ok(win) = std::env::var("WINDIR") {
+        dirs.push(PathBuf::from(win).join("Fonts"));
+    }
+
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "otc") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn families_in_file(path: &Path) -> Vec<String> {
+    match std::fs::File::open(path) {
+        Ok(mut f) => families_in(&mut f),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Family names declared inside a font file. Only the table directory and
+/// the `name` table are read, so a 280 MB `.ttc` costs two small seeks.
+fn families_in<R: Read + Seek>(r: &mut R) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(head) = read_at(r, 0, 12) else {
+        return out;
+    };
+    let starts: Vec<u64> = if &head[0..4] == b"ttcf" {
+        let count = be32(&head, 8) as usize;
+        if count == 0 || count > 64 {
+            return out;
+        }
+        let Ok(raw) = read_at(r, 12, count * 4) else {
+            return out;
+        };
+        (0..count).map(|i| be32(&raw, i * 4) as u64).collect()
+    } else {
+        vec![0]
+    };
+
+    for start in starts {
+        if let Some(mut names) = families_at(r, start) {
+            out.append(&mut names);
+        }
+    }
+    out
+}
+
+fn families_at<R: Read + Seek>(r: &mut R, start: u64) -> Option<Vec<String>> {
+    let head = read_at(r, start, 12).ok()?;
+    let tables = be16(&head, 4) as usize;
+    if tables == 0 || tables > 512 {
+        return None;
+    }
+    let dir = read_at(r, start + 12, tables * 16).ok()?;
+
+    for i in 0..tables {
+        let rec = &dir[i * 16..i * 16 + 16];
+        if &rec[0..4] != b"name" {
+            continue;
+        }
+        // In a `.ttc` these offsets are absolute, in a plain `.ttf` they are
+        // relative to the file start — either way `start` is not the base, so
+        // the value is used as-is.
+        let offset = be32(rec, 8) as u64;
+        let len = be32(rec, 12) as usize;
+        if !(6..=4 * 1024 * 1024).contains(&len) {
+            return None;
+        }
+        let table = read_at(r, offset, len).ok()?;
+        return Some(parse_name_table(&table));
+    }
+    None
+}
+
+/// Family names (id 1 and 16) found in a `name` table.
+fn parse_name_table(t: &[u8]) -> Vec<String> {
+    let count = be16(t, 2) as usize;
+    let storage = be16(t, 4) as usize;
+    let mut out = Vec::new();
+
+    for i in 0..count.min(1024) {
+        let rec = 6 + i * 12;
+        let Some(r) = t.get(rec..rec + 12) else {
+            break;
+        };
+        let id = be16(r, 6);
+        if id != 1 && id != 16 {
+            continue;
+        }
+        let platform = be16(r, 0);
+        let len = be16(r, 8) as usize;
+        let offset = be16(r, 10) as usize;
+        let Some(raw) = t.get(storage + offset..storage + offset + len) else {
+            continue;
+        };
+        let text = decode_name(platform, raw);
+        if !text.is_empty() {
+            out.push(text);
+        }
+    }
+    out
+}
+
+fn decode_name(platform: u16, raw: &[u8]) -> String {
+    if platform == 0 || platform == 3 {
+        let mut units = Vec::with_capacity(raw.len() / 2);
+        let mut i = 0;
+        while i + 1 < raw.len() {
+            units.push(u16::from_be_bytes([raw[i], raw[i + 1]]));
+            i += 2;
+        }
+        String::from_utf16_lossy(&units)
+    } else {
+        // Mac Roman in practice; close enough for a family name.
+        raw.iter().map(|b| *b as char).collect()
+    }
+}
+
+fn read_at<R: Read + Seek>(r: &mut R, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    r.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn be16(b: &[u8], i: usize) -> u16 {
+    u16::from_be_bytes([b[i], b[i + 1]])
+}
+
+fn be32(b: &[u8], i: usize) -> u32 {
+    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
 
 #[cfg(test)]
@@ -486,5 +658,100 @@ mod tests {
             family("0xProto Nerd Font Mono Light"),
             "0xProto Nerd Font Mono"
         );
+        assert!(entry_matches(
+            "更纱终端书呆黑体-简 Bold & 更纱终端书呆黑体-简 Italic",
+            "更纱终端书呆黑体-简"
+        ));
+        assert!(!entry_matches("A Bold & B Italic", "C"));
+    }
+
+    /// Minimal font file: header, one `name` table, no glyphs. Enough for the
+    /// reader, which must not care about anything else.
+    fn fixture_body(family: &str, table_offset: usize) -> Vec<u8> {
+        let mut store: Vec<u8> = Vec::new();
+        let mut records: Vec<(u16, u16, u16)> = Vec::new();
+        for (id, text) in [(1u16, family), (2u16, "Regular"), (16u16, family)] {
+            let offset = store.len() as u16;
+            let bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+            let len = bytes.len() as u16;
+            store.extend_from_slice(&bytes);
+            records.push((id, offset, len));
+        }
+
+        let storage = 6 + records.len() as u16 * 12;
+        let mut name = Vec::new();
+        name.extend_from_slice(&0u16.to_be_bytes());
+        name.extend_from_slice(&(records.len() as u16).to_be_bytes());
+        name.extend_from_slice(&storage.to_be_bytes());
+        for (id, offset, len) in &records {
+            name.extend_from_slice(&3u16.to_be_bytes());
+            name.extend_from_slice(&1u16.to_be_bytes());
+            name.extend_from_slice(&0x0409u16.to_be_bytes());
+            name.extend_from_slice(&id.to_be_bytes());
+            name.extend_from_slice(&len.to_be_bytes());
+            name.extend_from_slice(&offset.to_be_bytes());
+        }
+        name.extend_from_slice(&store);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&[0u8; 6]);
+        body.extend_from_slice(b"name");
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&(table_offset as u32).to_be_bytes());
+        body.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        body.extend_from_slice(&name);
+        body
+    }
+
+    fn fixture_ttf(family: &str) -> Vec<u8> {
+        fixture_body(family, 28)
+    }
+
+    fn fixture_ttc(families: &[&str]) -> Vec<u8> {
+        let mut out = vec![0u8; 12 + 4 * families.len()];
+        out[0..4].copy_from_slice(b"ttcf");
+        out[4..8].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        out[8..12].copy_from_slice(&(families.len() as u32).to_be_bytes());
+        for (i, fam) in families.iter().enumerate() {
+            let pos = out.len() as u32;
+            out[12 + i * 4..16 + i * 4].copy_from_slice(&pos.to_be_bytes());
+            // Inside a `.ttc` the table offsets are absolute, so a face that
+            // starts at `pos` keeps its table at `pos + 28`.
+            out.extend_from_slice(&fixture_body(fam, pos as usize + 28));
+        }
+        out
+    }
+
+    #[test]
+    fn family_names_come_out_of_the_name_table() {
+        let mut cur = std::io::Cursor::new(fixture_ttf("Sarasa Term SC Nerd"));
+        let names = families_in(&mut cur);
+        assert!(
+            names.iter().any(|n| n == "Sarasa Term SC Nerd"),
+            "英语族名没读出来: {names:?}"
+        );
+        assert!(!names.iter().any(|n| n == "Regular"), "把子族名当族名了");
+    }
+
+    #[test]
+    fn every_face_of_a_collection_is_read() {
+        let ttc = fixture_ttc(&["Sarasa Term SC Nerd", "更纱终端书呆黑体-简"]);
+        let mut cur = std::io::Cursor::new(ttc);
+        let names = families_in(&mut cur);
+        assert!(names.iter().any(|n| n == "Sarasa Term SC Nerd"));
+        assert!(
+            names.iter().any(|n| n == "更纱终端书呆黑体-简"),
+            "本地化族名没读出来: {names:?}"
+        );
+    }
+
+    #[test]
+    fn junk_does_not_parse_as_a_font() {
+        let mut cur = std::io::Cursor::new(b"not a font at all".to_vec());
+        assert!(families_in(&mut cur).is_empty());
+        let mut empty = std::io::Cursor::new(Vec::new());
+        assert!(families_in(&mut empty).is_empty());
     }
 }

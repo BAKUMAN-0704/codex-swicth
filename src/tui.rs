@@ -1217,10 +1217,7 @@ fn draw_help(f: &mut Frame) {
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            format!(
-                "字体由终端决定：codex-switch font --face \"{}\"",
-                crate::font::DEFAULT_FACE
-            ),
+            "字体由终端决定：codex-switch font --face \"<字体名>\"（--list 看装了什么）",
             s_dim(),
         ),
     ]));
