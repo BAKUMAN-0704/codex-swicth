@@ -1,0 +1,30 @@
+# build output
+/target
+*.exe
+*.pdb
+*.ilk
+
+# local runtime data: profiles may embed base_url, backups contain auth tokens
+/profiles.toml
+/keys.json
+/backups/
+/stash/
+*.local.toml
+*.local.json
+
+# secrets
+.env
+.env.*
+*.key
+*.pem
+auth.json
+secrets.json
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# local agent memory (may quote machine-specific paths)
+.workbuddy/memory/

@@ -1,0 +1,31 @@
+[package]
+name = "codex-switch"
+version = "0.2.0"
+edition = "2021"
+description = "Toggle Codex auth mode and model provider, keeping chat history visible across switches"
+license = "MIT"
+repository = "https://github.com/BAKUMAN-0704/codex-swicth"
+readme = "README.md"
+keywords = ["codex", "openai", "cli", "tui"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "codex-switch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml_edit = { version = "0.22", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+zstd = "0.13"
+ratatui = "0.29"
+crossterm = "0.28"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
