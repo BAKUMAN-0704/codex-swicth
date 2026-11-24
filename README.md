@@ -83,22 +83,29 @@ codex-switch doctor               # 环境自检
 
 ## 字体
 
-TUI 自己改不了字体：字符是终端模拟器画出来的，程序只能决定输出什么字符、什么颜色。Windows 上这个设置存在 Windows Terminal 的 `settings.json`，所以单独给了个子命令：
+"终端字体"在 Windows 上其实是两回事，改的地方也不同：
+
+| 你在哪看到这个界面 | 字体归谁管 | 怎么改 |
+| --- | --- | --- |
+| Windows Terminal 的标签页 | Windows Terminal | `codex-switch font --face "<名字>"`（改它的 `settings.json`） |
+| **双击 exe 打开的控制台窗口** | 我们自己的进程 | `codex-switch font --console --face "<名字>"`（记到 `window.toml`，启动时调 `SetCurrentConsoleFontEx`） |
 
 ```bash
-codex-switch font                               # 当前字体 + 配置文件位置
+codex-switch font                               # 标签页字体 + 配置文件位置
 codex-switch font --list                        # 系统已安装的字体
-codex-switch font --face "Sarasa Term SC Nerd"  # 切换
-codex-switch font --restore                     # 还原上一次修改
+codex-switch font --face "Cascadia Mono"        # 改 Windows Terminal 标签页
+codex-switch font --console                     # 看本窗口现在用什么字体
+codex-switch font --console --face "Sarasa Term SC Nerd" --size 18   # 改本 exe 的窗口
+codex-switch font --restore                     # 还原上一次对 settings.json 的修改
 ```
+
+`--console` 改的是**当前这个控制台窗口**，同时写进 `~/.codex-switch/window.toml`，所以下次双击 exe 还是这个字体。它会读回校验：如果窗口其实由宿主程序绘制（Windows Terminal、ConPTY），conhost 会接受请求但不生效，这时命令会直接告诉你"窗口没跟着变"，不会假装成功。
 
 `settings.json` 是带注释的 JSONC。整份解析再序列化会把注释和缩进全删掉，所以这里只定位并替换 `profiles.defaults.font.face` 的那一个字符串字面量，其余字节原样保留；写前备份到 `~/.codex-switch/backups/wt-settings-*.json`，写完还会回读校验，对不上就不落盘。
 
 **字体要挑等宽的**：TUI 按固定字符网格排版，比例字体（比如 HarmonyOS Sans SC）会让表格列和边框对不齐，列表右侧的状态标记会飘。只有中文等宽的需求，装 `Sarasa Term SC`（更纱黑体，一个 `.ttc` 装完全部字重）或 `Maple Mono NF CN`；不想装就直接用系统自带的 `Cascadia Mono`，中文回退到 Noto Sans SC / 微软雅黑，仍然占满两格，网格不会散。
 
-**名字要对**：`.ttc` 在注册表里只登记本地化名（例如 `更纱终端书呆黑体-简`），而 Windows Terminal 要的是字体内部的英文族名 `Sarasa Term SC Nerd`。所以"是否已安装"不能只查注册表 —— 注册表没有时还会打开字体文件读 `name` 表，两种名字都认得；`--list` 打出来的是注册表名，可以对照着用。
-
-还有一点：如果系统的默认终端仍是旧版控制台（conhost），双击 exe 打开的是 conhost，它不读 Windows Terminal 的配置；这种情况下请从 Windows Terminal 里运行本工具。
+**名字要对**：`.ttc` 在注册表里只登记本地化名（例如 `更纱终端书呆黑体-简`），而终端要的是字体内部的英文族名 `Sarasa Term SC Nerd`。所以"是否已安装"不能只查注册表 —— 注册表没有时还会打开字体文件读 `name` 表，两种名字都认得；`--list` 打出来的是注册表名，可以对照着用。
 
 ## 每次切换具体改了什么
 

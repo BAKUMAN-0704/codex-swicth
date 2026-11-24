@@ -1,6 +1,7 @@
 mod auth;
 mod backup;
 mod config_edit;
+mod console_font;
 mod font;
 mod history;
 mod paths;
@@ -65,8 +66,16 @@ fn run() -> Result<()> {
     let rest: Vec<&str> = positional.iter().skip(1).map(|s| s.as_str()).collect();
 
     match cmd {
-        "" | "tui" => tui::run(),
-        "menu" => interactive(opts),
+        "" | "tui" => {
+            // A console window we opened ourselves is ours to style; inside
+            // Windows Terminal this is accepted and ignored.
+            console_font::apply_saved();
+            tui::run()
+        }
+        "menu" => {
+            console_font::apply_saved();
+            interactive(opts)
+        }
         "list" | "ls" => cmd_list(),
         "status" => cmd_status(),
         "use" | "switch" => {
@@ -124,7 +133,8 @@ fn print_help() {
     for line in [
         "  codex-switch font                查看当前终端字体与配置文件位置",
         "  codex-switch font --list         列出系统已安装的字体",
-        "  codex-switch font --face <名称>  切换 Windows Terminal 的字体",
+        "  codex-switch font --face <名称>  切换 Windows Terminal 标签页的字体",
+        "  codex-switch font --console --face <名称>   切换本 exe 自己那个窗口的字体",
         "  codex-switch font --restore      还原上一次字体修改",
     ] {
         println!("{line}");
@@ -768,12 +778,18 @@ fn cmd_import(opts: Opts) -> Result<()> {
     Ok(())
 }
 
-/// `codex-switch font`: the one terminal setting a TUI cannot make for itself.
+/// `codex-switch font`: terminal fonts, which a TUI cannot set for itself.
+///
+/// Two targets, because on Windows they are two different mechanisms: the
+/// Windows Terminal tab (its `settings.json`) and the console window this exe
+/// opens when double-clicked (a runtime API call).
 fn cmd_font(args: &[String]) -> Result<()> {
     let mut face: Option<String> = None;
+    let mut size: Option<i16> = None;
     let mut restore = false;
     let mut dry_run = false;
     let mut yes = false;
+    let mut console = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -781,6 +797,15 @@ fn cmd_font(args: &[String]) -> Result<()> {
             "--face" | "-f" => {
                 face = Some(args.get(i + 1).context("--face 缺少字体名")?.clone());
                 i += 2;
+            }
+            "--size" | "-s" => {
+                let raw = args.get(i + 1).context("--size 缺少数值")?;
+                size = Some(raw.parse().context("--size 要是像素高度，例如 18")?);
+                i += 2;
+            }
+            "--console" | "-c" => {
+                console = true;
+                i += 1;
             }
             "--restore" => {
                 restore = true;
@@ -806,9 +831,20 @@ fn cmd_font(args: &[String]) -> Result<()> {
                 return Ok(());
             }
             other => bail!(
-                "font: 未知参数 {other}\n用法: codex-switch font [--face <名称>] [--list] [--restore]"
+                "font: 未知参数 {other}\n用法: codex-switch font [--face <名称>] [--console] [--size <px>] \
+                 [--list] [--restore]"
             ),
         }
+    }
+
+    if console {
+        return cmd_font_console(face, size, dry_run);
+    }
+    if !restore && size.is_some() {
+        println!(
+            "\n  {} --size 只对 --console 有效；Windows Terminal 的尺寸请调它的字号设置。",
+            ui::yellow("提示:")
+        );
     }
 
     let Some(path) = font::locate() else {
@@ -926,6 +962,67 @@ fn cmd_font(args: &[String]) -> Result<()> {
         );
     }
     println!();
+    Ok(())
+}
+
+/// `font --console`: style the console window this exe opens itself.
+fn cmd_font_console(face: Option<String>, size: Option<i16>, dry_run: bool) -> Result<()> {
+    let mut style = console_font::load();
+
+    println!("\n{}", ui::bold("本窗口字体（双击 exe 打开的控制台）"));
+    println!("  配置文件   {}", paths::window_path().display());
+    println!(
+        "  已保存     {}",
+        match (style.face.as_str(), style.size) {
+            ("", _) => ui::dim("未设置，沿用控制台默认字体"),
+            (f, Some(h)) => ui::cyan(&format!("{f}  {h}px")),
+            (f, None) => ui::cyan(f),
+        }
+    );
+    println!(
+        "  当前窗口   {}",
+        console_font::current_face().unwrap_or_else(|| ui::dim("读不到（不是控制台窗口）"))
+    );
+
+    let Some(target) = face else {
+        println!(
+            "\n{}\n  codex-switch font --console --face \"<字体名>\"\n  \
+             codex-switch font --console --face \"<字体名>\" --size 18\n",
+            ui::dim("设置（名字从 `codex-switch font --list` 里挑）:")
+        );
+        return Ok(());
+    };
+
+    if font::face_installed(&target) == Some(false) {
+        println!(
+            "\n  {} 系统里没找到 `{target}`，控制台多半会拒绝。",
+            ui::yellow("警告:")
+        );
+    }
+    if dry_run {
+        println!(
+            "\n{} 只演练：会写入 {} 并对当前窗口立即生效。",
+            ui::yellow("--dry-run："),
+            paths::window_path().display()
+        );
+        return Ok(());
+    }
+
+    style.face = target.clone();
+    if size.is_some() {
+        style.size = size;
+    }
+    console_font::save(&style)?;
+    println!(
+        "\n{} 已记到 {}，以后双击 exe 用 `{}`",
+        ui::green("✓"),
+        paths::window_path().display(),
+        target
+    );
+    match console_font::set(&style.face, style.size) {
+        Ok(()) => println!("  当前窗口也切过来了"),
+        Err(e) => println!("\n  {}\n  {:#}", ui::yellow("当前窗口没跟着变："), e),
+    }
     Ok(())
 }
 

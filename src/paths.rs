@@ -46,6 +46,11 @@ pub fn keys_path() -> PathBuf {
     switch_home().join("keys.json")
 }
 
+/// Look of the console window we open ourselves (font, cell height).
+pub fn window_path() -> PathBuf {
+    switch_home().join("window.toml")
+}
+
 pub fn stash_official_path() -> PathBuf {
     switch_home().join("stash").join("official-auth.json")
 }

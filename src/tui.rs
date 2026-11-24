@@ -2,10 +2,10 @@
 //!
 //! Two things shape this file:
 //!
-//! * A terminal programme cannot choose its own font. That belongs to the
-//!   terminal emulator, so the layout never assumes a light or dark palette and
-//!   uses `REVERSED` for emphasis — it stays readable either way. `codex-switch
-//!   font` flips the Windows Terminal setting if you want a different face.
+//! * Fonts come from the host, so the layout never assumes a light or dark
+//!   palette and uses `REVERSED` for emphasis — it stays readable either way.
+//!   Inside Windows Terminal the face belongs to the tab; in the console
+//!   window our own exe opens, `console_font` sets it at startup.
 //! * Probing for running processes forks a helper on Windows. Doing that per
 //!   frame makes the UI feel dead, so the result is cached and refreshed only
 //!   when something actually happens.
@@ -1217,7 +1217,7 @@ fn draw_help(f: &mut Frame) {
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            "字体由终端决定：codex-switch font --face \"<字体名>\"（--list 看装了什么）",
+            "本窗口字体：codex-switch font --console --face \"<字体名>\"",
             s_dim(),
         ),
     ]));
