@@ -1,6 +1,6 @@
 [package]
 name = "codex-switch"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Toggle Codex auth mode and model provider, keeping chat history visible across switches"
 license = "MIT"
